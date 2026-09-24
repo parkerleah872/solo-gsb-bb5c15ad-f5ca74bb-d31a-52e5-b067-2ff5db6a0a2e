@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 
 def _eps(magnitude: float) -> float:
@@ -81,6 +81,57 @@ class TurnCue:
     direction: str
     silence_seconds: float
     sufficient: bool
+
+
+@dataclass(frozen=True)
+class TurnSlot:
+    """一次跨页边界上的翻页空档安排。
+
+    仅当演奏序列中相邻两次发声所属页码不同时生成；翻页动作必须完整落在
+    **前一个演奏小节内**某只手的一段连续空闲窗中。每只手先各自选出能容纳
+    完整翻页动作（``turn_seconds`` 秒）的最晚开始时刻；再在所有可行的手之间
+    取最晚开始时刻，并列时优先左手。
+
+    :param boundary_seconds: 两次发声之间的边界时刻（秒，以演奏开始为 0），
+        即前一小节结束、后一小节开始的瞬间
+    :param from_page: 翻页前的页码（前一小节所在页，1 基）
+    :param to_page: 翻页后的页码（后一小节所在页，1 基）
+    :param from_measure: 前一小节的原谱 0 基小节号
+    :param to_measure: 后一小节的原谱 0 基小节号
+    :param from_playthrough: 前一小节所属重复段内第几遍（1 基）
+    :param to_playthrough: 后一小节所属重复段内第几遍（1 基）
+    :param available_hands: 存在能容纳完整翻页动作的空闲窗的手，
+        固定按左手优先、右手其后的顺序排列（如 ``["left", "right"]``）
+    :param hand: 实际选中的手（``"left"`` 左手或 ``"right"`` 右手）；
+        无可用窗时为 ``None``
+    :param action_start_seconds: 翻页动作开始时刻（秒，以演奏开始为 0）；
+        不可行为 ``None``
+    :param action_end_seconds: 翻页动作结束时刻（秒，不晚于边界时刻）；
+        不可行为 ``None``
+    """
+
+    boundary_seconds: float
+    from_page: int
+    to_page: int
+    from_measure: int
+    to_measure: int
+    from_playthrough: int
+    to_playthrough: int
+    available_hands: Tuple[str, ...]
+    hand: Optional[str]
+    action_start_seconds: Optional[float]
+    action_end_seconds: Optional[float]
+
+    @property
+    def feasible(self) -> bool:
+        """是否至少有一只手存在能容纳完整翻页动作的空闲窗。"""
+        return self.hand is not None
+
+
+# (起始拍, 结束拍) 的忙碌区间，左闭右开
+BusyInterval = Tuple[float, float]
+# 一只手（"left" / "right"）在各原谱小节内的忙碌区间序列
+HandsBusy = Mapping[str, Sequence[Sequence[float]]]
 
 
 # (起始小节, 结束小节, 演奏次数)，小节均为 0 基、两端皆含
@@ -162,6 +213,7 @@ class Rehearsal:
 
     measure_count: int
     tempo_bpm: float
+    beats_per_measure: Tuple[float, ...]  # 各原谱小节拍数（与小节号对应）
     events: List[PlayedMeasure]
     start_times: List[float]  # start_times[k]：第 k 个演奏事件的开始时间
     total_duration: float
@@ -264,6 +316,228 @@ class Rehearsal:
             )
         return cues
 
+    def turn_slots(
+        self,
+        hands_busy: HandsBusy,
+        turn_seconds: float,
+    ) -> List[TurnSlot]:
+        """按实际演奏序列为每个跨页边界安排翻页空档。
+
+        逐对考察相邻的两次发声：仅当二者所属页码不同时生成一条安排，边界
+        时刻取后一小节的开始时刻（与 :meth:`turn_cues` 一致）。忙碌区间按
+        **原谱小节号**给出，重复段的每一遍都复用同一小节的忙碌模式；翻页
+        动作只允许安排在前一个演奏小节内。
+
+        :param hands_busy: 含 ``"left"`` / ``"right"`` 两个键，各自是长度
+            等于规划小节数的数组；第 i 个元素是若干 ``[起拍, 止拍)`` 忙碌
+            区间，允许乱序与重叠，端点有限且满足
+            ``0 ≤ 起拍 < 止拍 ≤ 该小节拍数``
+        :param turn_seconds: 完整翻页动作所需秒数，必须为正
+        :raises RehearsalError: ``turn_seconds`` 非法，或 ``hands_busy``
+            结构/端点不合法
+        """
+        _validate_turn_inputs(
+            measure_count=self.measure_count,
+            beats_per_measure=self.beats_per_measure,
+            hands_busy=hands_busy,
+            turn_seconds=turn_seconds,
+        )
+
+        seconds_per_beat = 60.0 / self.tempo_bpm
+        # 每个原谱小节各只算一次：空闲窗只与原谱小节及其拍数、忙碌区间有关，
+        # 与该小节在重复段中出现几遍无关；各遍边界的时刻在使用时换算。
+        windows: dict[tuple[int, str], List[Tuple[float, float]]] = {}
+        for hand in ("left", "right"):
+            for measure in range(self.measure_count):
+                windows[(measure, hand)] = _free_windows(
+                    busy=hands_busy[hand][measure],
+                    beats=self.beats_per_measure[measure],
+                )
+
+        slots: List[TurnSlot] = []
+        for k in range(len(self.events) - 1):
+            prev, nxt = self.events[k], self.events[k + 1]
+            from_page = self.page_of(prev.measure)
+            to_page = self.page_of(nxt.measure)
+            if from_page == to_page:
+                continue
+
+            measure_start = self.start_times[k]
+            boundary = self.start_times[k + 1]
+
+            # 每只手各自取能容纳完整动作的最晚开始时刻（空闲窗右端 - 动作时长），
+            # 再在所有可行手之间选最晚者；左手先遍历且仅在严格更晚时替换，
+            # 故并列时优先左手。开始拍统一保留 9 位小数以吸收浮点噪声。
+            available: List[str] = []
+            best_start: Optional[float] = None
+            best_hand: Optional[str] = None
+            turn_beats = turn_seconds / seconds_per_beat
+            for hand in ("left", "right"):
+                latest = _latest_free_start(
+                    windows[(prev.measure, hand)],
+                    turn_beats=turn_beats,
+                )
+                if latest is None:
+                    continue
+                available.append(hand)
+                latest = round(latest, 9)
+                if best_start is None or latest > best_start:
+                    best_start, best_hand = latest, hand
+
+            action_start: Optional[float] = None
+            action_end: Optional[float] = None
+            if best_hand is not None and best_start is not None:
+                action_start = round(
+                    measure_start + best_start * seconds_per_beat, 9
+                )
+                action_end = round(action_start + turn_seconds, 9)
+                if action_start == 0:
+                    action_start = 0.0
+
+            slots.append(
+                TurnSlot(
+                    boundary_seconds=boundary,
+                    from_page=from_page,
+                    to_page=to_page,
+                    from_measure=prev.measure,
+                    to_measure=nxt.measure,
+                    from_playthrough=prev.playthrough,
+                    to_playthrough=nxt.playthrough,
+                    available_hands=tuple(available),
+                    hand=best_hand,
+                    action_start_seconds=action_start,
+                    action_end_seconds=action_end,
+                )
+            )
+        return slots
+
+
+def _validate_turn_inputs(
+    measure_count: int,
+    beats_per_measure: Sequence[float],
+    hands_busy: HandsBusy,
+    turn_seconds: float,
+) -> None:
+    """校验翻页空档参数：动作时长为正有限，忙碌数组结构与端点合法。"""
+    if not isinstance(turn_seconds, (int, float)) or isinstance(turn_seconds, bool):
+        raise RehearsalError("turn_seconds（翻页动作时长）必须是数值")
+    turn = float(turn_seconds)
+    if turn != turn or turn in (float("inf"), float("-inf")):
+        raise RehearsalError("turn_seconds（翻页动作时长）必须是有限数值")
+    if turn <= 0:
+        raise RehearsalError(
+            f"turn_seconds（翻页动作时长）必须为正数（实际 {turn:g}）"
+        )
+
+    if not isinstance(hands_busy, Mapping):
+        raise RehearsalError(
+            "hands_busy 必须是含 left、right 两只手忙碌区间的对象"
+        )
+    missing = [h for h in ("left", "right") if h not in hands_busy]
+    if missing:
+        raise RehearsalError(
+            f"hands_busy 缺少 {'、'.join(missing)} 的忙碌区间；"
+            "必须同时给出 left（左手）与 right（右手）"
+        )
+
+    for hand in ("left", "right"):
+        per_measure = hands_busy[hand]
+        if not isinstance(per_measure, (list, tuple)):
+            raise RehearsalError(
+                f"hands_busy.{hand} 必须是与原谱小节等长的区间数组"
+            )
+        if len(per_measure) != measure_count:
+            raise RehearsalError(
+                f"hands_busy.{hand} 数组长度（{len(per_measure)}）"
+                f"与规划小节数（{measure_count}）不符"
+            )
+        for measure, intervals in enumerate(per_measure):
+            if not isinstance(intervals, (list, tuple)):
+                raise RehearsalError(
+                    f"hands_busy.{hand}[{measure}] 必须是若干 [起拍, 止拍) 区间"
+                )
+            for idx, interval in enumerate(intervals):
+                if (
+                    not isinstance(interval, (list, tuple))
+                    or len(interval) != 2
+                ):
+                    raise RehearsalError(
+                        f"hands_busy.{hand}[{measure}] 第 {idx + 1} 个区间必须是"
+                        "恰好两个数 [起拍, 止拍)"
+                    )
+                start, end = interval
+                if (
+                    not isinstance(start, (int, float))
+                    or isinstance(start, bool)
+                    or not isinstance(end, (int, float))
+                    or isinstance(end, bool)
+                ):
+                    raise RehearsalError(
+                        f"hands_busy.{hand}[{measure}] 第 {idx + 1} 个区间的"
+                        "起拍、止拍必须是数值"
+                    )
+                start_f, end_f = float(start), float(end)
+                if start_f != start_f or end_f != end_f or start_f in (
+                    float("inf"),
+                    float("-inf"),
+                ) or end_f in (float("inf"), float("-inf")):
+                    raise RehearsalError(
+                        f"hands_busy.{hand}[{measure}] 第 {idx + 1} 个区间的"
+                        "起拍、止拍必须是有限数值"
+                    )
+                beats = float(beats_per_measure[measure])
+                if not (0 <= start_f < end_f <= beats):
+                    raise RehearsalError(
+                        f"hands_busy.{hand}[{measure}] 第 {idx + 1} 个区间"
+                        f" [{start_f:g}, {end_f:g}) 不合法：端点须满足"
+                        f" 0 ≤ 起拍 < 止拍 ≤ 该小节拍数（{beats:g}）"
+                    )
+
+
+def _free_windows(
+    busy: Sequence[Sequence[float]], beats: float
+) -> List[Tuple[float, float]]:
+    """把允许乱序、重叠的忙碌区间合并，返回小节内的连续空闲窗（拍）。
+
+    返回若干左闭右开区间 ``[a, b)``（``0 ≤ a < b ≤ beats``），按起点升序；
+    忙碌覆盖整小节时返回空列表。
+    """
+    intervals = sorted((float(a), float(b)) for a, b in busy)
+    merged: List[List[float]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1][1] = end
+        else:
+            merged.append([start, end])
+
+    windows: List[Tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in merged:
+        if start > cursor:
+            windows.append((cursor, start))
+        if end > cursor:
+            cursor = end
+    if cursor < beats:
+        windows.append((cursor, beats))
+    return windows
+
+
+def _latest_free_start(
+    windows: Sequence[Tuple[float, float]], turn_beats: float
+) -> Optional[float]:
+    """在空闲窗（拍）中选能容纳完整翻页动作的最晚开始时刻（拍偏移）。"""
+    best: Optional[float] = None
+    for start, end in windows:
+        candidate = end - turn_beats
+        if candidate + _eps(end) >= start:
+            if candidate < start:
+                candidate = start
+            if best is None or candidate > best:
+                best = candidate
+    return best
+
+
 
 def prepare_rehearsal(
     measure_count: int,
@@ -323,6 +597,7 @@ def prepare_rehearsal(
     return Rehearsal(
         measure_count=measure_count,
         tempo_bpm=tempo,
+        beats_per_measure=tuple(float(b) for b in beats_per_measure),
         events=events,
         start_times=start_times,
         total_duration=elapsed,

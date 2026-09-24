@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import math
 import os
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Any, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .planner import Plan, PlanningError, plan_pages
@@ -14,6 +18,7 @@ from .rehearsal import (
     Location,
     RehearsalError,
     TurnCue,
+    TurnSlot,
     prepare_rehearsal,
 )
 from .storage import PlanStore
@@ -37,6 +42,31 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+def _json_safe(value: Any) -> Any:
+    """把经 jsonable_encoder 归一化后的结构中 NaN/Infinity 替换为字符串。
+
+    否则请求体里夹带非有限浮点（如 NaN）时，422 响应在回显原始输入阶段
+    反而无法序列化，会错误地退化成 500。
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _json_safe(jsonable_encoder(exc.errors()))},
+    )
 
 
 # ---------------------------------------------------------------- 数据模型
@@ -322,6 +352,150 @@ def _cue_to_out(cue: TurnCue) -> TurnCueOut:
     )
 
 
+# ---------------------------------------- 排练翻页动作空档
+
+
+class HandsBusyIn(BaseModel):
+    """左右手在各原谱小节内的忙碌区间。
+
+    每个字段是与原谱小节等长的数组；第 i 个元素为若干
+    ``[起拍, 止拍)`` 忙碌区间，允许乱序与重叠。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 注意：内层各小节的区间数组含空数组时形如 [[], [0, 2]]，pydantic 2.10 对
+    # List[List[float]] 的异构嵌套推断存在缺陷（会把空内层数组错当数值层），
+    # 故此处先按 List[Any] 原样接收，结构与类型全部在下方校验器中严格检查。
+    left: List[Any] = Field(
+        ..., description="左手各小节的忙碌区间（[起拍, 止拍)，左闭右开）"
+    )
+    right: List[Any] = Field(
+        ..., description="右手各小节的忙碌区间（[起拍, 止拍)，左闭右开）"
+    )
+
+    @field_validator("left", "right")
+    @classmethod
+    def _validate_intervals(cls, value: List[Any]) -> List[Any]:
+        for measure, intervals in enumerate(value):
+            if not isinstance(intervals, list):
+                raise ValueError(f"第 {measure + 1} 小节必须是若干 [起拍, 止拍) 区间")
+            for idx, interval in enumerate(intervals):
+                if not isinstance(interval, list) or len(interval) != 2:
+                    raise ValueError(
+                        f"第 {measure + 1} 小节第 {idx + 1} 个区间必须是"
+                        "恰好两个数 [起拍, 止拍)"
+                    )
+                start, end = interval
+                if isinstance(start, bool) or isinstance(end, bool):
+                    raise ValueError(
+                        f"第 {measure + 1} 小节第 {idx + 1} 个区间的"
+                        "起拍、止拍必须是数值（不接受布尔值）"
+                    )
+                if not isinstance(start, (int, float)) or not isinstance(
+                    end, (int, float)
+                ):
+                    raise ValueError(
+                        f"第 {measure + 1} 小节第 {idx + 1} 个区间的"
+                        "起拍、止拍必须是数值"
+                    )
+                for label, beat in (("起拍", start), ("止拍", end)):
+                    if beat != beat or beat in (float("inf"), float("-inf")):
+                        raise ValueError(
+                            f"第 {measure + 1} 小节第 {idx + 1} 个区间的"
+                            f"{label}必须是有限数值（不接受 NaN 或 Infinity）"
+                        )
+        return value
+
+
+class TurnSlotsRequest(RehearsalParams):
+    """排练翻页动作空档请求体（沿用排练接口的拍数、速度、重复段参数）。"""
+
+    turn_seconds: float = Field(
+        ..., description="完整翻页动作所需秒数，必须为正"
+    )
+    hands_busy: HandsBusyIn = Field(
+        ...,
+        description="左右手各原谱小节的忙碌区间（[起拍, 止拍)，允许乱序与重叠）",
+    )
+
+    @model_validator(mode="after")
+    def _validate_turn_seconds(self) -> "TurnSlotsRequest":
+        value = self.turn_seconds
+        if isinstance(value, bool):
+            raise ValueError("turn_seconds 必须是数值（不接受布尔值）")
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("turn_seconds 必须是有限数值（不接受 NaN 或 Infinity）")
+        if value <= 0:
+            raise ValueError(f"turn_seconds 必须为正数（实际 {value:g}）")
+        return self
+
+
+class TurnSlotOut(BaseModel):
+    """一次跨页边界上的翻页动作安排。"""
+
+    boundary_seconds: float = Field(
+        ..., description="翻页边界时刻（秒，以演奏开始为 0）：前一小节结束处"
+    )
+    from_page: int = Field(..., description="翻页前页码（前一小节所在页，1 基）")
+    to_page: int = Field(..., description="翻页后页码（后一小节所在页，1 基）")
+    from_measure: int = Field(..., description="前一小节的原谱小节号（0 基）")
+    to_measure: int = Field(..., description="后一小节的原谱小节号（0 基）")
+    from_playthrough: int = Field(
+        ..., description="前一小节所属重复段内第几遍（1 基）；非重复段为 1"
+    )
+    to_playthrough: int = Field(
+        ..., description="后一小节所属重复段内第几遍（1 基）；非重复段为 1"
+    )
+    available_hands: List[str] = Field(
+        ...,
+        description="存在能容纳完整翻页动作的空闲窗的手（left 左手、right 右手），"
+        "固定左手在前、右手在后",
+    )
+    hand: Optional[str] = Field(
+        ...,
+        description="实际选用的手（left / right）；无可用窗时为 null",
+    )
+    action_start_seconds: Optional[float] = Field(
+        ..., description="翻页动作开始时刻（秒，以演奏开始为 0）；不可行为 null"
+    )
+    action_end_seconds: Optional[float] = Field(
+        ..., description="翻页动作结束时刻（秒，不晚于边界时刻）；不可行为 null"
+    )
+    feasible: bool = Field(
+        ..., description="是否存在能容纳完整翻页动作的连续空闲窗"
+    )
+
+
+class TurnSlotsResponse(BaseModel):
+    id: str
+    request: TurnSlotsRequest
+    turn_seconds: float = Field(..., description="本次请求的完整翻页动作时长（秒）")
+    total_duration: float = Field(
+        ..., description="按重复段展开后的演奏总时长（秒）"
+    )
+    slots: List[TurnSlotOut] = Field(
+        ..., description="按边界时刻升序的翻页动作安排（含不可行边界）"
+    )
+
+
+def _slot_to_out(slot: TurnSlot) -> TurnSlotOut:
+    return TurnSlotOut(
+        boundary_seconds=slot.boundary_seconds,
+        from_page=slot.from_page,
+        to_page=slot.to_page,
+        from_measure=slot.from_measure,
+        to_measure=slot.to_measure,
+        from_playthrough=slot.from_playthrough,
+        to_playthrough=slot.to_playthrough,
+        available_hands=list(slot.available_hands),
+        hand=slot.hand,
+        action_start_seconds=slot.action_start_seconds,
+        action_end_seconds=slot.action_end_seconds,
+        feasible=slot.feasible,
+    )
+
+
 # ---------------------------------------------------------------- 接口
 
 
@@ -462,6 +636,62 @@ def plan_rehearsal_cues(
         min_turn_time=plan_request.min_turn_time,
         total_duration=rehearsal.total_duration,
         cues=[_cue_to_out(cue) for cue in cues],
+    )
+
+
+@app.post(
+    "/api/v1/plans/{plan_id}/rehearsal/turn-slots",
+    response_model=TurnSlotsResponse,
+)
+def plan_rehearsal_turn_slots(
+    plan_id: str, payload: TurnSlotsRequest
+) -> TurnSlotsResponse:
+    """为已保存方案的每个跨页边界安排具体的翻页动作空档。
+
+    沿用排练接口的每小节拍数、速度与重复段，按实际演奏顺序展开；另传正数
+    ``turn_seconds``（完整翻页动作时长）与左右手忙碌区间 ``hands_busy``
+    （与原谱小节等长，每小节若干 [起拍, 止拍)，允许乱序、重叠）。仅对相邻
+    演奏小节跨页的边界，在前一个演奏小节内求每只手的连续空闲窗，选能容纳
+    完整翻页动作的最晚开始时刻，并列时优先左手；无可用窗的边界也保留并标记
+    为不可行。
+    """
+    assert store is not None
+    record = store.get(plan_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"规划结果不存在：{plan_id}")
+
+    plan_request = PlanRequest(**record["request"])
+    plan_result = PlanResult(**record["result"])
+    page_starts = [p.start_measure for p in plan_result.pages]
+
+    try:
+        rehearsal = prepare_rehearsal(
+            measure_count=len(plan_request.measure_heights),
+            beats_per_measure=payload.beats_per_measure,
+            tempo_bpm=payload.tempo_bpm,
+            repeats=[
+                (r.start_measure, r.end_measure, r.play_count)
+                for r in payload.repeats
+            ],
+            page_starts=page_starts,
+        )
+        slots = rehearsal.turn_slots(
+            hands_busy={
+                "left": payload.hands_busy.left,
+                "right": payload.hands_busy.right,
+            },
+            turn_seconds=payload.turn_seconds,
+        )
+    except RehearsalError as exc:
+        # 数组长度不符 / 重复段重叠 / 忙碌区间端点越界等语义错误：明确报错
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return TurnSlotsResponse(
+        id=record["id"],
+        request=payload,
+        turn_seconds=payload.turn_seconds,
+        total_duration=rehearsal.total_duration,
+        slots=[_slot_to_out(slot) for slot in slots],
     )
 
 
